@@ -170,6 +170,7 @@ const PermissionsCheck = () => {
         learning: currentLearning || undefined,
       };
       // http://localhost:8080/profile
+      // https://livekit-backend-1zev.onrender.com/profile
       (async () => {
         try {
           await fetch("https://livekit-backend-1zev.onrender.com/profile", {
@@ -193,6 +194,7 @@ const PermissionsCheck = () => {
             params2.set("learning", backendPayload.learning);
 
           window.location.href = `https://livekit-frontend-mck7.onrender.com/?${params2.toString()}`;
+          // window.location.href = `http://localhost:3000/?${params2.toString()}`;
         }
       })();
       return;

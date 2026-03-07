@@ -1,6 +1,7 @@
 import React, { useEffect, useState, useRef } from "react";
-import { useLocation, useNavigate } from "react-router-dom";
+import { useLocation } from "react-router-dom";
 import { usePorcupine } from "@picovoice/porcupine-react";
+import axios from "axios";
 import Vapi from "@vapi-ai/web";
 import {
   FiPhoneCall,
@@ -16,15 +17,14 @@ import {
   FaVolumeUp,
   FaWifi,
 } from "react-icons/fa";
-import { MdWifiOff } from "react-icons/md";
+// Corrected:
+import { MdWifiOff } from "react-icons/md"; // ✅ correct package
 import { useESP32 } from "./contexts/ESP32Context";
 import { useMicrophone } from "./contexts/MicrophoneContext";
-import { apiRequest, isUnauthorizedError } from "./config/api";
-import { useAuth } from "./contexts/AuthContext";
 
-// Initialize Vapi instance
+// will initialize Vapi instance once assistant is created
 let vapi;
-
+let introAudioIntervalID;
 const VoiceWidget = () => {
   // Microphone context
   const { stream, setStream } = useMicrophone();
@@ -32,7 +32,9 @@ const VoiceWidget = () => {
   // Microphone mute state
   const [isMicMuted, setIsMicMuted] = useState(false);
 
+  // Toggle microphone mute/unmute
   const toggleMicrophone = () => {
+    // Vapi SDK mute/unmute logic
     if (
       typeof vapi !== "undefined" &&
       vapi &&
@@ -44,15 +46,13 @@ const VoiceWidget = () => {
         !isMicMuted ? "Microphone muted (Vapi)" : "Microphone unmuted (Vapi)",
       );
     } else {
+      // fallback: globally mute all active microphone streams`
       console.warn(
         "Vapi instance not available, falling back to global mic mute.",
       );
     }
   };
-
   const location = useLocation();
-  const navigate = useNavigate();
-  const { logout } = useAuth();
   const queryParams = new URLSearchParams(location.search);
   const {
     espCharacteristic,
@@ -63,11 +63,6 @@ const VoiceWidget = () => {
 
   const vapiRef = useRef(null);
   const errorAudioIntervalRef = useRef(null);
-
-  // Ref for the intro audio loop to ensure we can clear it reliably
-  const introAudioIntervalRef = useRef(null);
-  const currentIntroAudioRef = useRef(null);
-
   const [isAssistantOn, setIsAssistantOn] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [childName, setChildName] = useState(
@@ -76,8 +71,8 @@ const VoiceWidget = () => {
   const [interests, setInterests] = useState(
     queryParams.get("interests") || "",
   );
-  const [age, setAge] = useState(queryParams.get("age") || "");
-  const [gender, setGender] = useState(queryParams.get("gender") || "");
+  const [age, setAge] = useState(queryParams.get("age") || ""); //new
+  const [gender, setGender] = useState(queryParams.get("gender") || ""); //new
   const [currentLearning, setCurrentLearning] = useState(
     queryParams.get("currentLearning") || "",
   );
@@ -117,12 +112,15 @@ const VoiceWidget = () => {
 
   const DEEPGRAM_API_KEY = "2434d902a6a617075faae7044e92fca628228f9a";
 
+  // Get VAPI keys from localStorage or URL params
   const vapiPrivateKey =
     queryParams.get("vapiKey") || localStorage.getItem("vapiKey");
   const vapiPublicKey =
     queryParams.get("vapiPublicKey") ||
     localStorage.getItem("vapiPublicKey") ||
     "1f568b16-001f-4f1c-8f34-02a4aa1ea376";
+
+  // "57bd3c84-dd46-41ce-82ab-2bbe48163d90";
 
   const {
     keywordDetection,
@@ -149,15 +147,30 @@ const VoiceWidget = () => {
     isAssistantOnRef.current = isAssistantOn;
   }, [isAssistantOn]);
 
-  // Setup ESP32 characteristic
+  //To get the assistant id on disconnect form the local storage
+  useEffect(() => {
+    const savedId = localStorage.getItem("assistantId");
+
+    if (savedId) {
+      console.log("Restoring assistantId:", savedId);
+      setAssistantId(savedId);
+      setAssistantStatus("created");
+    }
+  }, []);
+
+  // Setup ESP32 characteristic and event listener
   useEffect(() => {
     if (espCharacteristic) {
       console.log("ESP32 characteristic available, setting up event listener");
 
+      // Add event listener for ESP32 characteristic value changes
       const handleCharacteristicValueChanged = async (event) => {
         const value = new TextDecoder().decode(event.target.value);
         console.log("Received from ESP:", value);
-
+        // if (value === "SUPPORT") {
+        //   console.log("ESP32 SUPPORT signal received, toggling assistant");
+        //   toggleAssistant();
+        // }
         if (value === "SUPPORT") {
           console.log("Hardware button pressed");
 
@@ -165,12 +178,12 @@ const VoiceWidget = () => {
             console.log("Assistant not created. Creating...");
             await createAssistant();
           } else {
-            // Only toggle if we aren't already toggling
             toggleAssistant();
           }
         }
       };
 
+      // Enable notifications and add event listener
       espCharacteristic
         .startNotifications()
         .then(() => {
@@ -184,6 +197,7 @@ const VoiceWidget = () => {
           console.error("Failed to start ESP32 notifications:", err);
         });
 
+      // Cleanup function
       return () => {
         if (espCharacteristic) {
           espCharacteristic.removeEventListener(
@@ -193,10 +207,12 @@ const VoiceWidget = () => {
           console.log("ESP32 characteristic event listener removed");
         }
       };
+    } else {
+      console.log("ESP32 characteristic not available");
     }
-  }, [espCharacteristic, assistantId]); // Added assistantId dependency
+  }, [espCharacteristic]);
 
-  // Error Audio Helpers
+  // Function to play error audio
   const playErrorAudio = (errorMessage) => {
     if ("speechSynthesis" in window) {
       const utterance = new SpeechSynthesisUtterance(errorMessage);
@@ -207,41 +223,36 @@ const VoiceWidget = () => {
     }
   };
 
+  // Function to start error audio interval
   const startErrorAudioInterval = (errorMessage) => {
+    // Clear any existing interval
     if (errorAudioIntervalRef.current) {
       clearInterval(errorAudioIntervalRef.current);
     }
+
+    // Play immediately
     playErrorAudio(errorMessage);
+
+    // Set up interval to play every 10 seconds
     errorAudioIntervalRef.current = setInterval(() => {
       playErrorAudio(errorMessage);
     }, 10000);
   };
 
+  // Function to stop error audio interval
   const stopErrorAudioInterval = () => {
     if (errorAudioIntervalRef.current) {
       clearInterval(errorAudioIntervalRef.current);
       errorAudioIntervalRef.current = null;
     }
+    // Stop any ongoing speech
     if ("speechSynthesis" in window) {
       speechSynthesis.cancel();
     }
   };
 
-  // Helper to reliably stop intro audio
-  const stopIntroAudio = () => {
-    console.log("🛑 Stopping intro audio loop");
-    if (introAudioIntervalRef.current) {
-      clearInterval(introAudioIntervalRef.current);
-      introAudioIntervalRef.current = null;
-    }
-    if (currentIntroAudioRef.current) {
-      currentIntroAudioRef.current.pause();
-      currentIntroAudioRef.current.currentTime = 0;
-      currentIntroAudioRef.current = null;
-    }
-  };
-
-  // Create assistant
+  // Create assistant when component mounts
+  // step-1
   const createAssistant = async () => {
     if (!childName) {
       console.log("Missing required parameters");
@@ -255,19 +266,24 @@ const VoiceWidget = () => {
     try {
       setIsCreatingAssistant(true);
       setAssistantError("");
-      stopErrorAudioInterval();
+      stopErrorAudioInterval(); // Stop any previous error audio
 
       let customPrompt = ``;
       if (interests) {
-        customPrompt += `Child's Interests & Preferences: ${interests}\n`;
+        customPrompt += "Child's Interests & Preferences: ${interests}\n";
       }
       if (currentLearning) {
-        customPrompt += `Current Learning in School: ${currentLearning}\n`;
+        customPrompt += " Current Learning in School: ${currentLearning}\n";
       }
 
-      const response = await apiRequest("/vapi/create-assistant", {
-        method: "POST",
-        body: {
+      // https://api-talkypies.vercel.app
+      // http://localhost:5000
+      // https://https://talkypie-vapi-backend.onrender.com/vapi/create-assistant
+      const response = await axios.post(
+        // "https://talkypie-backend-v3.onrender.com/vapi/create-assistant",
+        "http://localhost:5000/vapi/create-assistant",
+        // http://guidable-axton-forky.ngrok-free.dev
+        {
           childName,
           age,
           gender,
@@ -276,39 +292,36 @@ const VoiceWidget = () => {
           prompt,
           toyName,
           customTranscript,
-          interests,
-          currentLearning,
         },
-      });
+      );
 
       console.log("Assistant created:", response);
-      const newAssistantId = response.assistantId;
-      const receivedFinalPrompt = response.finalPrompt;
+      const newAssistantId = response.data.assistantId;
+      const receivedFinalPrompt = response.data.finalPrompt;
+
+      // Initialize VAPI with public key for client SDK
 
       vapi = new Vapi(vapiPublicKey);
       setAssistantId(newAssistantId);
       setFinalPrompt(receivedFinalPrompt || "");
       setAssistantStatus("created");
       setIsLoading(true);
+      //  const audio = new Audio("/connect.mp3");
+      // audio.play();
+      // Store assistant ID for later use
+      localStorage.setItem("assistantId", newAssistantId);
     } catch (error) {
       console.error("Failed to create assistant:", error);
       setAssistantStatus("failed");
 
       let errorMsg = "";
-      if (isUnauthorizedError(error)) {
-        errorMsg = "Your login session expired. Please login again.";
-        logout();
-        navigate("/login", {
-          replace: true,
-          state: { from: `/vapi${location.search}` },
-        });
-      } else if (
-        error?.status === 402 ||
-        error?.message?.toLowerCase().includes("credits")
+      if (
+        error.response?.status === 402 ||
+        error.response?.data?.message?.includes("credits")
       ) {
         errorMsg =
           "VAPI credits exhausted. Please check your VAPI account and add more credits.";
-      } else if (error?.status === 401) {
+      } else if (error.response?.status === 401) {
         errorMsg =
           "Invalid VAPI private key. Please check your VAPI private key and try again.";
       } else {
@@ -323,25 +336,24 @@ const VoiceWidget = () => {
     }
   };
 
-  // Start assistant when created
+  // step-2 start the assistant when created
   useEffect(() => {
     if (assistantId && assistantStatus === "created") {
-      toggleAssistant();
+      toggleAssistant(); // Start the assistant if it was created successfully
     }
   }, [assistantId, assistantStatus]);
 
-  // Auto-create assistant
+  // Auto-create assistant when component mounts
   useEffect(() => {
     if (isFormSubmitted && childName && assistantStatus === "pending") {
       createAssistant();
     }
   }, [isFormSubmitted, childName, vapiPrivateKey]);
 
-  // Cleanup on unmount
+  // Cleanup error audio interval on component unmount
   useEffect(() => {
     return () => {
       stopErrorAudioInterval();
-      stopIntroAudio();
     };
   }, []);
 
@@ -365,6 +377,7 @@ const VoiceWidget = () => {
     }
   };
 
+  // step-8
   const sendOffCommand = async () => {
     try {
       if (!espCharacteristic) return;
@@ -375,7 +388,25 @@ const VoiceWidget = () => {
     }
   };
 
-  // Interrupt logic
+  const resetInactivityTimer = () => {
+    if (inactivityTimeoutRef.current) {
+      clearTimeout(inactivityTimeoutRef.current);
+    }
+
+    inactivityTimeoutRef.current = setTimeout(() => {
+      console.log("Inactivity timeout reached. Closing Vapi...");
+      setIsLoading(true);
+      const audio = new Audio("/disconnect.mp3");
+      audio.play();
+      audio.onended = () => {
+        console.log("stop assistant & offCMD after disconnect audio");
+
+        toggleAssistant();
+      };
+    }, 1000);
+  };
+
+  // Attempt to halt assistant audio mid-response when the user starts speaking
   const interruptAssistantResponse = () => {
     if (!vapi) return;
 
@@ -392,6 +423,7 @@ const VoiceWidget = () => {
         return;
       }
 
+      // Fallback: try muting output quickly if no explicit interrupt API exists
       if (typeof vapi.setMuted === "function") {
         vapi.setMuted(true);
         console.log("Vapi muted as a fallback during user speech.");
@@ -412,6 +444,7 @@ const VoiceWidget = () => {
       clearTimeout(userSilenceTimerRef.current);
     }
 
+    // Assume user stops speaking if no transcript arrives for a short window
     userSilenceTimerRef.current = setTimeout(() => {
       userSpeakingRef.current = false;
       if (typeof vapi?.resume === "function") {
@@ -422,10 +455,9 @@ const VoiceWidget = () => {
           console.warn("Failed to resume Vapi after silence:", e);
         }
       }
-    }, 1000);
+    }, 1200);
   };
 
-  // Porcupine Init
   useEffect(() => {
     if (isFormSubmitted && assistantStatus === "created") {
       init(porcupineKey, porcupineKeyword, porcupineModel)
@@ -439,7 +471,9 @@ const VoiceWidget = () => {
     return () => release();
   }, [init, start, release, isFormSubmitted, porcupineKey, assistantStatus]);
 
-  // Deepgram + Wake Audio
+  // new setup for deepgram and wake word
+
+  // useEffect to manage wake up audio
   useEffect(() => {
     if (
       !isFormSubmitted ||
@@ -454,6 +488,7 @@ const VoiceWidget = () => {
 
     console.log("🔁 Assistant idle — Starting wake audio + Deepgram");
 
+    // === Wake up.mp3 Setup ===
     const audio = new Audio("/wake up.mp3");
     audio.loop = false;
 
@@ -465,17 +500,29 @@ const VoiceWidget = () => {
       wakeUpAudioRef.current = audio;
     };
 
+    // Play initially
     audio.play().catch((e) => console.warn("Initial play failed:", e));
     wakeUpAudioRef.current = audio;
 
+    // Loop every 10s until wake word is detected or assistant is turned on
     const intervalId = setInterval(() => {
       if (!wakeWordDetected && !isAssistantOnRef.current) {
         playAudio();
       }
     }, 10000);
 
+    // === Deepgram Setup ===
+
     const initializeDeepgram = async () => {
       try {
+        // Cleanup
+        // deepgramSocketRef.current?.close?.();
+        // if (mediaRecorderRef.current?.state && mediaRecorderRef.current.state !== "inactive") {
+        //     mediaRecorderRef.current.stop();
+        //   }
+        // mediaStreamRef.current?.getTracks().forEach(t => t.stop());
+
+        // Create WebSocket
         const socket = new WebSocket(
           "wss://api.deepgram.com/v1/listen?punctuate=true&language=en",
           ["token", DEEPGRAM_API_KEY],
@@ -484,6 +531,12 @@ const VoiceWidget = () => {
 
         socket.onopen = async () => {
           try {
+            // if(!stream) {
+            //   const userStream = await navigator.mediaDevices.getUserMedia({
+            //   audio: true,
+            //   });
+            //   setStream(userStream);
+            // }
             const stream = await navigator.mediaDevices.getUserMedia({
               audio: true,
             });
@@ -525,8 +578,10 @@ const VoiceWidget = () => {
           if (transcript && triggers.some((w) => transcript.includes(w))) {
             console.log("🟢 Wake word:", transcript);
             setWakeWordDetected(true);
-            // socket.close(); // let trigger logic handle close via cleanup
-            // mediaRecorderRef.current?.stop();
+            triggerVapi();
+            socket.close();
+            mediaRecorderRef.current?.stop();
+            mediaStreamRef.current?.getTracks().forEach((t) => t.stop());
           }
         };
 
@@ -539,6 +594,7 @@ const VoiceWidget = () => {
 
     initializeDeepgram();
 
+    // === Cleanup Both Audio & Deepgram ===
     return () => {
       console.log("🧹 Cleanup Deepgram + Audio");
       audio.pause?.();
@@ -569,56 +625,50 @@ const VoiceWidget = () => {
     }
   }, [keywordDetection]);
 
-  // The Fixed Intro Audio Function
+  // step-4
   const introAudio = async () => {
     console.log("Starting intro audio... before connecting tovapi");
 
-    // Clear any existing intro audio loop first
-    stopIntroAudio();
-
+    // Stop any wake-up audio interval
     if (wakeUpAudioRef.current) {
-      wakeUpAudioRef.current.pause();
+      wakeUpAudioRef.current.pause(); // Pause any ongoing wake-up audio
       console.log("Paused wake-up audio before starting intro audio.");
-      wakeUpAudioRef.current.currentTime = 0;
+      wakeUpAudioRef.current.currentTime = 0; // Reset the audio to the beginning
     }
 
+    // step-5
     const audio = new Audio("/connect.mp3");
-    currentIntroAudioRef.current = audio; // Track this audio
     await audio.play();
-
     await new Promise((resolve) => {
       audio.onended = () => {
-        console.log("wait until intro audio finished");
+        console.log("waait until intro audio finished");
         resolve();
       };
     });
 
+    // step-6
     await sendBlinkCommand();
 
-    // Loop the intro audio every 5 seconds until speech starts
-    // Storing ID in Ref so we can clear it reliably
-    introAudioIntervalRef.current = setInterval(() => {
-      const repeatedAudio = new Audio("/connect.mp3");
-      currentIntroAudioRef.current = repeatedAudio;
-      repeatedAudio
-        .play()
-        .catch((e) => console.log("Intro loop play error", e));
-      console.log("Playing intro audio loop...");
+    let repeatedAudio;
+
+    // Repeat the intro audio every 5 seconds until speech starts
+    introAudioIntervalID = setInterval(() => {
+      repeatedAudio = new Audio(audio.src);
+      repeatedAudio.play();
+      console.log("Playing intro audio...");
     }, 5000);
 
-    // Setup listener to stop this loop when assistant speaks
-    if (vapi) {
-      vapi.once("speech-start", async () => {
-        console.log("speech-start called only once");
-        stopIntroAudio(); // THIS CLEARS THE LOOP
-        console.log("Assistant has started speaking.");
-        sendOnCommand();
-        console.log("Eva connected. Stopped repeating audio.");
-      });
-    }
+    vapi.once("speech-start", async () => {
+      repeatedAudio.pause();
+      console.log("speech-start called only once");
+      console.log("Assistant has started speaking.");
+      clearInterval(introAudioIntervalID);
+      sendOnCommand();
+      console.log("Eva connected. Stopped repeating audio.");
+    });
   };
 
-  // Start listener for wake word
+  // start listening for wake word and toggle assistant when detected
   useEffect(() => {
     if (
       (mediaDetection || wakeWordDetected) &&
@@ -631,11 +681,15 @@ const VoiceWidget = () => {
       }
 
       setIsLoading(true);
+      // direct call toggleAssistant and inside it call introAudio fun
       toggleAssistant();
+
+      return () => {
+        // clearInterval(introAudioIntervalID);
+      };
     }
   }, [wakeWordDetected, isFormSubmitted, mediaDetection, assistantStatus]);
 
-  // Backend Socket
   useEffect(() => {
     if (!isFormSubmitted) return;
 
@@ -643,10 +697,15 @@ const VoiceWidget = () => {
       "wss://talkypie-backend-v3.onrender.com/api/custom-transcriber",
     );
 
-    socket.onopen = () => console.log("Connected to backend WebSocket");
+    socket.onopen = () => {
+      console.log("Connected to backend WebSocket");
+    };
+
     socket.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);
+        console.log("Parsed data from backend:", data);
+
         if (
           data.type === "MEDIA_KEY" &&
           data.message.toLowerCase().includes("next")
@@ -657,13 +716,20 @@ const VoiceWidget = () => {
         console.error("Invalid JSON from backend:", event.data);
       }
     };
-    return () => socket.close();
+
+    socket.onerror = (err) => {
+      console.error("WebSocket error:", err);
+    };
+
+    return () => {
+      socket.close();
+    };
   }, [isFormSubmitted]);
 
+  // step-6
   const startVapiAssistant = async () => {
     if (!assistantId) {
       console.error("No assistant ID available");
-      stopIntroAudio(); // Safety
       return;
     }
 
@@ -675,18 +741,19 @@ const VoiceWidget = () => {
       setIsAssistantOn(true);
       isAssistantOnRef.current = true;
 
+      // For listening assistants talking and listning states
+
       vapi.on("speech-start", () => {
         assistantSpeakingRef.current = true;
         sendOnCommand();
-        // Redundant stop here just in case 'once' missed it
-        stopIntroAudio();
       });
 
       vapi.on("speech-end", () => {
         assistantSpeakingRef.current = false;
         sendBlinkCommand();
       });
-
+      //new
+      // Listen for transcript messages from Vapi so we can detect farewell phrases
       const farewellHandler = (message) => {
         try {
           if (message?.type === "transcript") {
@@ -711,8 +778,13 @@ const VoiceWidget = () => {
               "see ya",
             ];
             if (farewells.some((f) => text.includes(f))) {
-              console.log("Farewell detected:", text);
+              console.log(
+                "Farewell detected in transcript, ending call:",
+                text,
+              );
+              // Prevent double-invokes by checking the ref
               if (isAssistantOnRef.current) {
+                // Use toggleAssistant which performs the proper shutdown sequence
                 toggleAssistant();
               }
             }
@@ -722,53 +794,94 @@ const VoiceWidget = () => {
         }
       };
 
+      // Register handler if supported by the SDK
       try {
         vapi.on("message", farewellHandler);
       } catch (e) {
-        console.warn("Vapi message register failed:", e);
+        console.warn(
+          "Vapi does not support message events or registering failed:",
+          e,
+        );
       }
-
+      //new
+      // when the assistant ended the call implicitly, we have to manually perform end call operations
       vapi.once("call-end", () => {
-        console.log("Call ended event received");
+        console.log(
+          "Call ended event received",
+          isAssistantOn,
+          "  ",
+          isAssistantOnRef.current,
+        );
 
+        //new
+        // Try to remove the message handler if SDK supports removal
         try {
           if (typeof vapi.off === "function") {
             vapi.off("message");
           }
         } catch (e) {
-          console.warn("Failed to remove message listener:", e);
+          console.warn("Failed to remove message listener on call-end:", e);
         }
+        //new
         if (isAssistantOn || isAssistantOnRef.current) {
-          toggleAssistant();
+          // resetInactivityTimer();
+          toggleAssistant(); // Call toggleAssistant to handle end call processing
         }
       });
     } catch (error) {
       console.error("Error starting call:", error);
       setIsLoading(false);
-      stopIntroAudio(); // CRITICAL: Stop sound if call fails
+      clearInterval(introAudioIntervalID); // Stop repeating intro audio
       setWakeWordDetected(false);
       setMediaDetect(false);
+      // if vapi failed to start call, stop the intro audio interval and show a popup message
+      // to the user that failed to connect please try again. taost duration: 2sec.
     }
   };
 
+  // step-7
   const endCallProcessing = async () => {
-    console.log("End call processing started...");
-    stopIntroAudio(); // Safety check
+    console.log("End call processing started..... before stopping Vapi");
     try {
       const audio = new Audio("/disconnect.mp3");
       await audio.play();
       await new Promise((resolve) => {
         audio.onended = () => {
+          console.log("wait until disconnect audio finished");
           resolve();
         };
       });
+
       await sendOffCommand();
     } catch (error) {
       console.error("Error processing end call:", error);
     }
   };
 
+  useEffect(() => {
+    return () => {
+      console.log(
+        "Cleaning up on unmount, stopping Vapi and sending off command: ",
+        isAssistantOnRef.current,
+        "|| ",
+        isAssistantOn,
+      );
+      if (isAssistantOnRef.current) {
+        console.log(
+          "Cleaning up on unmount, stopping Vapi and sending off command",
+        );
+        toggleAssistant(); // Ensure assistant is turned off}
+      }
+
+      if (userSilenceTimerRef.current) {
+        clearTimeout(userSilenceTimerRef.current);
+      }
+    };
+  }, []);
+
+  // step-3 toggle assistant on/off
   const toggleAssistant = async () => {
+    // console.log("assistant status from ref: inside ", isAssistantOnRef.current);
     // 🔒 Prevent reconnect if ID missing
     if (!assistantId && !isAssistantOnRef.current) {
       console.warn("Assistant ID missing. Creating assistant...");
@@ -777,12 +890,7 @@ const VoiceWidget = () => {
     }
 
     if (isAssistantOnRef.current) {
-      // --- TURNING OFF ---
       setIsLoading(true);
-
-      // Stop the intro loop if it's running!
-      stopIntroAudio();
-
       vapi.setMuted(false);
       setIsMicMuted(false);
       vapi.stop();
@@ -796,7 +904,7 @@ const VoiceWidget = () => {
       setWakeWordDetected(false);
       setMediaDetect(false);
     } else {
-      // --- TURNING ON ---
+      // await sendOnCommand();
       setIsLoading(true);
       await introAudio();
       startVapiAssistant();
@@ -806,7 +914,7 @@ const VoiceWidget = () => {
   const retryCreateAssistant = () => {
     setAssistantStatus("pending");
     setAssistantError("");
-    stopErrorAudioInterval();
+    stopErrorAudioInterval(); // Stop error audio when retrying
     createAssistant();
   };
 
