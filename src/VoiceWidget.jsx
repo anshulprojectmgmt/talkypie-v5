@@ -114,6 +114,9 @@ const VoiceWidget = () => {
   const assistantSpeakingRef = useRef(false);
   const userSpeakingRef = useRef(false);
   const userSilenceTimerRef = useRef(null);
+  const assistantOutputMutedRef = useRef(false);
+  const interruptFallbackTimeoutRef = useRef(null);
+  const vapiEventHandlersRef = useRef(null);
 
   const DEEPGRAM_API_KEY = "2434d902a6a617075faae7044e92fca628228f9a";
 
@@ -342,6 +345,8 @@ const VoiceWidget = () => {
     return () => {
       stopErrorAudioInterval();
       stopIntroAudio();
+      detachVapiEventHandlers();
+      resetBargeInState();
     };
   }, []);
 
@@ -375,54 +380,147 @@ const VoiceWidget = () => {
     }
   };
 
-  // Interrupt logic
-  const interruptAssistantResponse = () => {
-    if (!vapi) return;
-
-    try {
-      if (typeof vapi.interrupt === "function") {
-        vapi.interrupt();
-        console.log("Vapi interrupt invoked due to user speech.");
-        return;
-      }
-
-      if (typeof vapi.pause === "function") {
-        vapi.pause();
-        console.log("Vapi pause invoked due to user speech.");
-        return;
-      }
-
-      if (typeof vapi.setMuted === "function") {
-        vapi.setMuted(true);
-        console.log("Vapi muted as a fallback during user speech.");
-        setTimeout(() => {
-          if (userSpeakingRef.current) return;
-          vapi.setMuted(false);
-          console.log("Vapi unmuted after fallback mute.");
-        }, 1200);
-      }
-    } catch (e) {
-      console.warn("Failed to interrupt assistant response:", e);
+  const clearUserSilenceTimer = () => {
+    if (userSilenceTimerRef.current) {
+      clearTimeout(userSilenceTimerRef.current);
+      userSilenceTimerRef.current = null;
     }
   };
 
-  const markUserSpeaking = () => {
+  const clearInterruptFallbackTimeout = () => {
+    if (interruptFallbackTimeoutRef.current) {
+      clearTimeout(interruptFallbackTimeoutRef.current);
+      interruptFallbackTimeoutRef.current = null;
+    }
+  };
+
+  const setAssistantOutputMuted = (shouldMute) => {
+    if (!vapi || typeof vapi.send !== "function") return;
+    if (assistantOutputMutedRef.current === shouldMute) return;
+
+    try {
+      vapi.send({
+        type: "control",
+        control: shouldMute ? "mute-assistant" : "unmute-assistant",
+      });
+      assistantOutputMutedRef.current = shouldMute;
+      console.log(
+        shouldMute
+          ? "Assistant audio muted for barge-in."
+          : "Assistant audio unmuted.",
+      );
+    } catch (e) {
+      console.warn(
+        `Failed to ${shouldMute ? "mute" : "unmute"} assistant audio:`,
+        e,
+      );
+    }
+  };
+
+  const removeVapiListener = (eventName, handler) => {
+    if (!vapi || typeof handler !== "function") return;
+
+    try {
+      if (typeof vapi.removeListener === "function") {
+        vapi.removeListener(eventName, handler);
+        return;
+      }
+
+      if (typeof vapi.off === "function") {
+        vapi.off(eventName, handler);
+      }
+    } catch (e) {
+      console.warn(`Failed to remove Vapi listener for ${eventName}:`, e);
+    }
+  };
+
+  const detachVapiEventHandlers = () => {
+    const handlers = vapiEventHandlersRef.current;
+    if (!handlers) return;
+
+    Object.entries(handlers).forEach(([eventName, handler]) => {
+      removeVapiListener(eventName, handler);
+    });
+    vapiEventHandlersRef.current = null;
+  };
+
+  const resetBargeInState = () => {
+    clearInterruptFallbackTimeout();
+    clearUserSilenceTimer();
+    userSpeakingRef.current = false;
+    assistantSpeakingRef.current = false;
+
+    if (assistantOutputMutedRef.current) {
+      setAssistantOutputMuted(false);
+    }
+    assistantOutputMutedRef.current = false;
+  };
+
+  // Interrupt logic
+  const interruptAssistantResponse = () => {
+    if (
+      !vapi ||
+      !isAssistantOnRef.current ||
+      !assistantSpeakingRef.current ||
+      !userSpeakingRef.current
+    ) {
+      return;
+    }
+
+    clearInterruptFallbackTimeout();
+    interruptFallbackTimeoutRef.current = setTimeout(() => {
+      interruptFallbackTimeoutRef.current = null;
+
+      if (
+        !vapi ||
+        !isAssistantOnRef.current ||
+        !assistantSpeakingRef.current ||
+        !userSpeakingRef.current
+      ) {
+        return;
+      }
+
+      try {
+        if (typeof vapi.interrupt === "function") {
+          vapi.interrupt();
+          console.log("Vapi interrupt invoked due to user speech.");
+          return;
+        }
+
+        if (typeof vapi.pause === "function") {
+          vapi.pause();
+          console.log("Vapi pause invoked due to user speech.");
+          return;
+        }
+
+        setAssistantOutputMuted(true);
+      } catch (e) {
+        console.warn("Failed to interrupt assistant response:", e);
+      }
+    }, 120);
+  };
+
+  const markUserStoppedSpeaking = () => {
+    clearInterruptFallbackTimeout();
+    clearUserSilenceTimer();
+    userSpeakingRef.current = false;
+
+    if (assistantOutputMutedRef.current) {
+      setAssistantOutputMuted(false);
+    }
+  };
+
+  const markUserSpeaking = ({ shouldInterrupt = true } = {}) => {
     userSpeakingRef.current = true;
-    if (userSilenceTimerRef.current) {
-      clearTimeout(userSilenceTimerRef.current);
+    clearUserSilenceTimer();
+
+    if (shouldInterrupt) {
+      interruptAssistantResponse();
     }
 
     userSilenceTimerRef.current = setTimeout(() => {
-      userSpeakingRef.current = false;
-      if (typeof vapi?.resume === "function") {
-        try {
-          vapi.resume();
-          console.log("Vapi resumed after user silence.");
-        } catch (e) {
-          console.warn("Failed to resume Vapi after silence:", e);
-        }
-      }
-    }, 1000);
+      markUserStoppedSpeaking();
+    }, 750);
   };
 
   // Porcupine Init
@@ -669,81 +767,137 @@ const VoiceWidget = () => {
 
     setIsLoading(true);
     try {
-      const call = await vapi.start(assistantId);
+      detachVapiEventHandlers();
+      resetBargeInState();
+
+      const assistantOverrides = {
+        firstMessageInterruptionsEnabled: true,
+        stopSpeakingPlan: {
+          numWords: 0,
+          voiceSeconds: 0.12,
+          backoffSeconds: 0.35,
+        },
+      };
+
+      const call = await vapi.start(assistantId, assistantOverrides);
       console.log("Call started:", call);
       setIsLoading(false);
       setIsAssistantOn(true);
       isAssistantOnRef.current = true;
 
-      vapi.on("speech-start", () => {
+      const handleAssistantSpeechStart = () => {
         assistantSpeakingRef.current = true;
-        sendOnCommand();
-        // Redundant stop here just in case 'once' missed it
         stopIntroAudio();
-      });
+        if (!userSpeakingRef.current && assistantOutputMutedRef.current) {
+          setAssistantOutputMuted(false);
+        }
+        sendOnCommand();
+      };
 
-      vapi.on("speech-end", () => {
+      const handleAssistantSpeechEnd = () => {
         assistantSpeakingRef.current = false;
+        clearInterruptFallbackTimeout();
+        if (!userSpeakingRef.current && assistantOutputMutedRef.current) {
+          setAssistantOutputMuted(false);
+        }
         sendBlinkCommand();
-      });
+      };
 
-      const farewellHandler = (message) => {
+      const handleMessage = (message) => {
         try {
-          if (message?.type === "transcript") {
-            const text = (message.transcript || "").toLowerCase();
-            const isUser =
-              message.role === "user" ||
-              message.role === "speaker" ||
-              message.role === 0;
-            if (isUser) {
-              markUserSpeaking();
-              if (assistantSpeakingRef.current) {
-                interruptAssistantResponse();
+          if (message?.type === "speech-update") {
+            if (message.role === "assistant") {
+              if (message.status === "started") {
+                handleAssistantSpeechStart();
+              } else {
+                handleAssistantSpeechEnd();
               }
+              return;
             }
-            if (!isUser) return;
 
-            const farewells = [
-              "bye bye",
-              "goodbye",
-              "bye",
-              "see you",
-              "see ya",
-            ];
-            if (farewells.some((f) => text.includes(f))) {
-              console.log("Farewell detected:", text);
-              if (isAssistantOnRef.current) {
-                toggleAssistant();
+            if (message.role === "user") {
+              if (message.status === "started") {
+                markUserSpeaking();
+              } else {
+                markUserStoppedSpeaking();
               }
+              return;
+            }
+          }
+
+          if (message?.type === "user-interrupted") {
+            assistantSpeakingRef.current = false;
+            markUserSpeaking({ shouldInterrupt: false });
+            sendBlinkCommand();
+            return;
+          }
+
+          const isTranscriptMessage =
+            message?.type === "transcript" ||
+            message?.type === "transcript[transcriptType='final']";
+          if (!isTranscriptMessage) return;
+
+          const text = (message.transcript || "").toLowerCase().trim();
+          const isUser =
+            message.role === "user" ||
+            message.role === "speaker" ||
+            message.role === 0;
+          if (!isUser) return;
+
+          markUserSpeaking({
+            shouldInterrupt: assistantSpeakingRef.current,
+          });
+
+          if (message.transcriptType !== "final" || !text) return;
+
+          const farewells = [
+            "bye bye",
+            "goodbye",
+            "bye",
+            "see you",
+            "see ya",
+          ];
+          if (farewells.some((f) => text.includes(f))) {
+            console.log("Farewell detected:", text);
+            if (isAssistantOnRef.current) {
+              toggleAssistant();
             }
           }
         } catch (e) {
-          console.error("Error in farewellHandler:", e);
+          console.error("Error in Vapi message handler:", e);
         }
       };
 
+      const handleCallEnd = () => {
+        console.log("Call ended event received");
+        detachVapiEventHandlers();
+        resetBargeInState();
+        if (isAssistantOnRef.current) {
+          toggleAssistant();
+        }
+      };
+
+      vapiEventHandlersRef.current = {
+        "speech-start": handleAssistantSpeechStart,
+        "speech-end": handleAssistantSpeechEnd,
+        message: handleMessage,
+        "call-end": handleCallEnd,
+      };
+
+      vapi.on("speech-start", handleAssistantSpeechStart);
+      vapi.on("speech-end", handleAssistantSpeechEnd);
+
       try {
-        vapi.on("message", farewellHandler);
+        vapi.on("message", handleMessage);
       } catch (e) {
         console.warn("Vapi message register failed:", e);
       }
 
-      vapi.once("call-end", () => {
-        console.log("Call ended event received");
-
-        try {
-          if (typeof vapi.off === "function") {
-            vapi.off("message");
-          }
-        } catch (e) {
-          console.warn("Failed to remove message listener:", e);
-        }
-        if (isAssistantOn || isAssistantOnRef.current) {
-          toggleAssistant();
-        }
-      });
+      vapi.once("call-end", handleCallEnd);
     } catch (error) {
       console.error("Error starting call:", error);
+      detachVapiEventHandlers();
+      resetBargeInState();
       setIsLoading(false);
       stopIntroAudio(); // CRITICAL: Stop sound if call fails
       setWakeWordDetected(false);
@@ -782,6 +936,8 @@ const VoiceWidget = () => {
 
       // Stop the intro loop if it's running!
       stopIntroAudio();
+      detachVapiEventHandlers();
+      resetBargeInState();
 
       vapi.setMuted(false);
       setIsMicMuted(false);
