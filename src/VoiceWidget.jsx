@@ -736,9 +736,8 @@ const VoiceWidget = () => {
   // Backend Socket
   useEffect(() => {
     if (!isFormSubmitted) return;
-
     const socket = new WebSocket(
-      "wss://talkypie-backend-v3.onrender.com/api/custom-transcriber",
+      "wss://talkypie-backend-test-repo.onrender.com/api/custom-transcriber",
     );
 
     socket.onopen = () => console.log("Connected to backend WebSocket");
@@ -850,13 +849,7 @@ const VoiceWidget = () => {
 
           if (message.transcriptType !== "final" || !text) return;
 
-          const farewells = [
-            "bye bye",
-            "goodbye",
-            "bye",
-            "see you",
-            "see ya",
-          ];
+          const farewells = ["bye bye", "goodbye", "bye", "see you", "see ya"];
           if (farewells.some((f) => text.includes(f))) {
             console.log("Farewell detected:", text);
             if (isAssistantOnRef.current) {
