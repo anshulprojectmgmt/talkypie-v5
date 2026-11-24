@@ -125,7 +125,8 @@ const VoiceWidget = () => {
   const vapiPublicKey =
     queryParams.get("vapiPublicKey") ||
     localStorage.getItem("vapiPublicKey") ||
-    "1f568b16-001f-4f1c-8f34-02a4aa1ea376";
+    "b693f553-7e24-437d-8230-f2517f82b582";
+  // "1f568b16-001f-4f1c-8f34-02a4aa1ea376";
 
   const {
     keywordDetection,
